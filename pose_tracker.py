@@ -46,18 +46,16 @@ PoseLandmarker = vision.PoseLandmarker
 PoseLandmarkerOptions = vision.PoseLandmarkerOptions
 VisionRunningMode = vision.RunningMode
 
-POSE_LANDMARK_NAMES = [
-    "NOSE", "LEFT_EYE_INNER", "LEFT_EYE", "LEFT_EYE_OUTER",
-    "RIGHT_EYE_INNER", "RIGHT_EYE", "RIGHT_EYE_OUTER",
-    "LEFT_EAR", "RIGHT_EAR", "MOUTH_LEFT", "MOUTH_RIGHT",
-    "LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_ELBOW", "RIGHT_ELBOW",
-    "LEFT_WRIST", "RIGHT_WRIST", "LEFT_PINKY", "RIGHT_PINKY",
-    "LEFT_INDEX", "RIGHT_INDEX", "LEFT_THUMB", "RIGHT_THUMB",
-    "LEFT_HIP", "RIGHT_HIP", "LEFT_KNEE", "RIGHT_KNEE",
-    "LEFT_ANKLE", "RIGHT_ANKLE", "LEFT_HEEL", "RIGHT_HEEL",
-    "LEFT_FOOT_INDEX", "RIGHT_FOOT_INDEX",
-]
-POSE_LANDMARKS = {name: idx for idx, name in enumerate(POSE_LANDMARK_NAMES)}
+# Basic points only: body joints plus a simple face outline (skips
+# fine-grained face, hand, and foot landmarks). Values are each name's real
+# index in MediaPipe's 33-point landmark output.
+POSE_LANDMARKS = {
+    "NOSE": 0, "LEFT_EYE": 2, "RIGHT_EYE": 5, "LEFT_EAR": 7, "RIGHT_EAR": 8,
+    "LEFT_SHOULDER": 11, "RIGHT_SHOULDER": 12, "LEFT_ELBOW": 13, "RIGHT_ELBOW": 14,
+    "LEFT_WRIST": 15, "RIGHT_WRIST": 16, "LEFT_HIP": 23, "RIGHT_HIP": 24,
+    "LEFT_KNEE": 25, "RIGHT_KNEE": 26, "LEFT_ANKLE": 27, "RIGHT_ANKLE": 28,
+}
+INDEX_TO_NAME = {idx: name for name, idx in POSE_LANDMARKS.items()}
 
 target_index = POSE_LANDMARKS[TARGET_LANDMARK_NAME]
 
@@ -111,11 +109,12 @@ while cap.isOpened():
 
     if latest_result and latest_result.pose_landmarks:
         for pose_landmarks in latest_result.pose_landmarks:
-            for lm in pose_landmarks:
+            for idx in POSE_LANDMARKS.values():
+                lm = pose_landmarks[idx]
                 cx, cy = int(lm.x * w), int(lm.y * h)
                 cv2.circle(frame, (cx, cy), ALL_LANDMARKS_RADIUS, ALL_LANDMARKS_COLOR, -1)
 
-            target_name = POSE_LANDMARK_NAMES[target_index]
+            target_name = INDEX_TO_NAME[target_index]
             target = pose_landmarks[target_index]
             tx, ty = int(target.x * w), int(target.y * h)
             cv2.circle(frame, (tx, ty), TARGET_RADIUS, TARGET_COLOR, TARGET_THICKNESS)
