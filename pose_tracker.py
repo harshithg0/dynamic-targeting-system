@@ -17,7 +17,7 @@ MIN_POSE_DETECTION_CONFIDENCE = 0.5   # confidence a person exists in frame
 MIN_POSE_PRESENCE_CONFIDENCE = 0.5    # confidence pose is still present between frames
 MIN_TRACKING_CONFIDENCE = 0.5         # confidence when tracking landmarks frame-to-frame
 
-# Which body part to highlight (see PoseLandmark enum for full list)
+# Which body part to highlight
 TARGET_LANDMARK_NAME = "RIGHT_WRIST"
 
 # Camera
@@ -32,6 +32,10 @@ TARGET_RADIUS = 10
 TARGET_THICKNESS = 2
 WINDOW_NAME = "Pose Tracking"
 QUIT_KEY = 'q'
+TYPE_TARGET_KEY = 't'   # enter typing mode to name a new target landmark
+INPUT_COLOR = (255, 255, 0)   # cyan, BGR format
+ERROR_COLOR = (0, 0, 255)     # red, BGR format
+STATUS_DISPLAY_FRAMES = 60    # how many frames to show the error message
 
 # ============================
 # Setup PoseLandmarker
@@ -42,7 +46,20 @@ PoseLandmarker = vision.PoseLandmarker
 PoseLandmarkerOptions = vision.PoseLandmarkerOptions
 VisionRunningMode = vision.RunningMode
 
-TARGET_LANDMARK = mp.solutions.pose.PoseLandmark[TARGET_LANDMARK_NAME].value
+POSE_LANDMARK_NAMES = [
+    "NOSE", "LEFT_EYE_INNER", "LEFT_EYE", "LEFT_EYE_OUTER",
+    "RIGHT_EYE_INNER", "RIGHT_EYE", "RIGHT_EYE_OUTER",
+    "LEFT_EAR", "RIGHT_EAR", "MOUTH_LEFT", "MOUTH_RIGHT",
+    "LEFT_SHOULDER", "RIGHT_SHOULDER", "LEFT_ELBOW", "RIGHT_ELBOW",
+    "LEFT_WRIST", "RIGHT_WRIST", "LEFT_PINKY", "RIGHT_PINKY",
+    "LEFT_INDEX", "RIGHT_INDEX", "LEFT_THUMB", "RIGHT_THUMB",
+    "LEFT_HIP", "RIGHT_HIP", "LEFT_KNEE", "RIGHT_KNEE",
+    "LEFT_ANKLE", "RIGHT_ANKLE", "LEFT_HEEL", "RIGHT_HEEL",
+    "LEFT_FOOT_INDEX", "RIGHT_FOOT_INDEX",
+]
+POSE_LANDMARKS = {name: idx for idx, name in enumerate(POSE_LANDMARK_NAMES)}
+
+target_index = POSE_LANDMARKS[TARGET_LANDMARK_NAME]
 
 latest_result = None
 
@@ -69,6 +86,13 @@ landmarker = PoseLandmarker.create_from_options(options)
 cap = cv2.VideoCapture(CAMERA_INDEX)
 start_time = time.time()
 
+typing = False
+input_buffer = ""
+status_message = ""
+status_frames_left = 0
+
+print(f"Controls: '{TYPE_TARGET_KEY}' = type a new target landmark, Enter = confirm, Esc = cancel, '{QUIT_KEY}' = quit")
+
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
@@ -91,13 +115,72 @@ while cap.isOpened():
                 cx, cy = int(lm.x * w), int(lm.y * h)
                 cv2.circle(frame, (cx, cy), ALL_LANDMARKS_RADIUS, ALL_LANDMARKS_COLOR, -1)
 
-            target = pose_landmarks[TARGET_LANDMARK]
+            target_name = POSE_LANDMARK_NAMES[target_index]
+            target = pose_landmarks[target_index]
             tx, ty = int(target.x * w), int(target.y * h)
             cv2.circle(frame, (tx, ty), TARGET_RADIUS, TARGET_COLOR, TARGET_THICKNESS)
+            cv2.putText(
+                frame,
+                f"{target_name} ({tx}, {ty})",
+                (tx + TARGET_RADIUS + 5, ty),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                TARGET_COLOR,
+                2,
+            )
             print(f"Target pixel: ({tx}, {ty})  norm: ({target.x:.3f}, {target.y:.3f})")
 
+    if typing:
+        cv2.putText(
+            frame,
+            f"New target: {input_buffer}_",
+            (10, h - 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            INPUT_COLOR,
+            2,
+        )
+    elif status_frames_left > 0:
+        cv2.putText(
+            frame,
+            status_message,
+            (10, h - 40),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.7,
+            ERROR_COLOR,
+            2,
+        )
+        status_frames_left -= 1
+
     cv2.imshow(WINDOW_NAME, frame)
-    if cv2.waitKey(1) & 0xFF == ord(QUIT_KEY):
+    key = cv2.waitKey(1) & 0xFF
+
+    if typing:
+        if key == 13:  # Enter: confirm typed name
+            typed_name = input_buffer.strip().upper()
+            if typed_name in POSE_LANDMARKS:
+                target_index = POSE_LANDMARKS[typed_name]
+                status_message = f"Target set to {typed_name}"
+            else:
+                status_message = f"Unknown landmark: {typed_name}"
+            status_frames_left = STATUS_DISPLAY_FRAMES
+            typing = False
+            input_buffer = ""
+        elif key == 27:  # Esc: cancel typing
+            typing = False
+            input_buffer = ""
+        elif key == 8:  # Backspace
+            input_buffer = input_buffer[:-1]
+        elif key != 255 and chr(key).isprintable():
+            input_buffer += chr(key)
+    else:
+        if key == ord(QUIT_KEY):
+            break
+        elif key == ord(TYPE_TARGET_KEY):
+            typing = True
+            input_buffer = ""
+
+    if cv2.getWindowProperty(WINDOW_NAME, cv2.WND_PROP_VISIBLE) < 1:
         break
 
 cap.release()
