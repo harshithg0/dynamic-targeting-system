@@ -3,3 +3,5 @@ __pycache__/
 *.pyc
 .DS_Store
 pose_landmarker.task
+coco-2017/
+mpii_human_pose_v1/
