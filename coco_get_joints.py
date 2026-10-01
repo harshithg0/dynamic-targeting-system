@@ -3,7 +3,8 @@ Extract 14-joint 2D pose labels from COCO person-keypoints annotations.
 
 For each annotated person with at least MIN_KEYPOINTS labeled keypoints,
 derives a head/neck/shoulders/elbows/wrists/hips/knees/ankles joint set and
-writes {filepath, joints} records to OUTPUT_PATH.
+writes {filepath, joints} records to OUTPUT_PATH. Joints COCO marks as
+unlabeled (v=0) are written as null instead of COCO's placeholder (0, 0).
 """
 import json
 import os
@@ -17,24 +18,27 @@ MIN_KEYPOINTS = 8
 # COCO keypoint order (https://cocodataset.org/#keypoints-eval):
 # 0 nose, 5/6 l/r shoulder, 7/8 l/r elbow, 9/10 l/r wrist,
 # 11/12 l/r hip, 13/14 l/r knee, 15/16 l/r ankle
+# Each point is (x, y, v): v=0 unlabeled, v=1 labeled but occluded,
+# v=2 labeled and visible.
 
 
 def extract_joints(keypoints):
     """Convert a flat COCO keypoint list into our 14-joint dict."""
-    pts = [keypoints[i:i + 3] for i in range(0, len(keypoints), 3)]
+    triples = [keypoints[i:i + 3] for i in range(0, len(keypoints), 3)]
+    # Unlabeled points are None so they can't be mistaken for real (0, 0) coords.
+    pts = [[x, y] if v > 0 else None for x, y, v in triples]
 
-    nose = pts[0][:2]
-    l_sh, r_sh = pts[5][:2], pts[6][:2]
-    neck = [(l_sh[0] + r_sh[0]) / 2, (l_sh[1] + r_sh[1]) / 2]
+    l_sh, r_sh = pts[5], pts[6]
+    neck = [(l_sh[0] + r_sh[0]) / 2, (l_sh[1] + r_sh[1]) / 2] if l_sh and r_sh else None
 
     return {
-        "head": nose, "neck": neck,
+        "head": pts[0], "neck": neck,
         "l_shoulder": l_sh, "r_shoulder": r_sh,
-        "l_elbow": pts[7][:2], "r_elbow": pts[8][:2],
-        "l_wrist": pts[9][:2], "r_wrist": pts[10][:2],
-        "l_hip": pts[11][:2], "r_hip": pts[12][:2],
-        "l_knee": pts[13][:2], "r_knee": pts[14][:2],
-        "l_ankle": pts[15][:2], "r_ankle": pts[16][:2],
+        "l_elbow": pts[7], "r_elbow": pts[8],
+        "l_wrist": pts[9], "r_wrist": pts[10],
+        "l_hip": pts[11], "r_hip": pts[12],
+        "l_knee": pts[13], "r_knee": pts[14],
+        "l_ankle": pts[15], "r_ankle": pts[16],
     }
 
 
