@@ -9,9 +9,15 @@ Training runs in two stages: head only with the backbone frozen, then the
 whole network at a lower learning rate. Unlabeled joints are excluded from
 the loss using the mask saved by preprocess_dataset.py.
 
+Training can be stopped at any point (Ctrl+C, closing the terminal) and
+picks up where it left off when the same command is run again, losing at
+most BACKUP_EVERY_STEPS batches of progress. Delete MODEL_DIR to start over.
+
 Usage: python train.py [--limit N] [--head-epochs N] [--full-epochs N]
 """
 import argparse
+import csv
+import glob
 import math
 import os
 
@@ -23,7 +29,9 @@ from tensorflow.keras import layers
 
 DATA_PREFIX = "pose_dataset"
 MODEL_DIR = "models"
-MODEL_PATH = os.path.join(MODEL_DIR, "pose_model.keras")
+SAMPLE_MODEL_DIR = os.path.join(MODEL_DIR, "sample")  # used for --limit test runs
+MODEL_FILENAME = "pose_model.keras"
+BACKUP_EVERY_STEPS = 200  # ~1 min of training on CPU
 
 JOINT_ORDER = [
     "head", "neck",
@@ -190,21 +198,50 @@ def pck(y_true, y_pred):
     return tf.reduce_sum(hits) / tf.maximum(tf.reduce_sum(mask), 1)
 
 
-def train_stage(model, train_ds, val_ds, epochs, lr, name):
-    """Compile and fit for one stage, keeping the weights with the best val loss."""
+def best_val_loss(model_dir):
+    """Lowest val loss logged by any earlier epoch, or None before the first one."""
+    losses = []
+    for path in glob.glob(os.path.join(model_dir, "history_*.csv")):
+        with open(path) as f:
+            losses += [float(row["val_loss"]) for row in csv.DictReader(f)]
+    return min(losses, default=None)
+
+
+def train_stage(model, train_ds, val_ds, epochs, lr, name, model_dir):
+    """Compile and fit for one stage, then load the weights with the best val loss.
+
+    Progress is backed up every BACKUP_EVERY_STEPS batches, so an interrupted
+    stage resumes from its last backup. A finished stage is marked with a
+    .done file and skipped on later runs.
+    """
+    model_path = os.path.join(model_dir, MODEL_FILENAME)
+    done_path = os.path.join(model_dir, f"stage_{name}.done")
+    if os.path.exists(done_path):
+        print(f"--- Stage {name} already finished, skipping ---")
+        model.load_weights(model_path)
+        return
+
     model.compile(optimizer=keras.optimizers.Adam(lr), loss=masked_huber_loss,
                   metrics=[mean_px_error, pck])
     callbacks = [
-        keras.callbacks.ModelCheckpoint(MODEL_PATH, save_best_only=True),
+        keras.callbacks.BackupAndRestore(os.path.join(model_dir, f"backup_{name}"),
+                                         save_freq=BACKUP_EVERY_STEPS),
+        # Starting from the best loss so far stops a resumed run from
+        # overwriting a better checkpoint saved before the interruption.
+        keras.callbacks.ModelCheckpoint(model_path, save_best_only=True,
+                                        initial_value_threshold=best_val_loss(model_dir)),
         keras.callbacks.ReduceLROnPlateau(factor=0.5, patience=3),
-        keras.callbacks.EarlyStopping(patience=6, restore_best_weights=True),
-        keras.callbacks.CSVLogger(os.path.join(MODEL_DIR, f"history_{name}.csv")),
+        keras.callbacks.EarlyStopping(patience=6),
+        keras.callbacks.CSVLogger(os.path.join(model_dir, f"history_{name}.csv"), append=True),
     ]
     print(f"--- Stage: {name} ({epochs} epochs, lr={lr}) ---")
     model.fit(train_ds, validation_data=val_ds, epochs=epochs, callbacks=callbacks)
 
+    model.load_weights(model_path)
+    open(done_path, "w").close()
 
-def report(model, images, labels, mask):
+
+def report(model, images, labels, mask, model_dir):
     """Print per-joint val error and save a grid of predictions over crops."""
     pred = model.predict(images, batch_size=256, verbose=0)
     dist = np.linalg.norm((pred - labels).reshape(-1, NUM_JOINTS, 2), axis=2)
@@ -228,7 +265,7 @@ def report(model, images, labels, mask):
                 draw.ellipse((tx - 3, ty - 3, tx + 3, ty + 3), fill=(0, 255, 0))
             draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(255, 0, 0))
         grid.paste(crop, ((k % cols) * tile, (k // cols) * tile))
-    path = os.path.join(MODEL_DIR, "val_predictions.png")
+    path = os.path.join(model_dir, "val_predictions.png")
     grid.save(path)
     print(f"Saved prediction grid to {path}")
 
@@ -239,7 +276,8 @@ def main():
     parser.add_argument("--head-epochs", type=int, default=5)
     parser.add_argument("--full-epochs", type=int, default=40)
     args = parser.parse_args()
-    os.makedirs(MODEL_DIR, exist_ok=True)
+    model_dir = SAMPLE_MODEL_DIR if args.limit else MODEL_DIR
+    os.makedirs(model_dir, exist_ok=True)
 
     train = load_split("train", args.limit)
     val = load_split("val", args.limit)
@@ -250,11 +288,11 @@ def main():
     model.summary()
 
     backbone.trainable = False
-    train_stage(model, train_ds, val_ds, args.head_epochs, 1e-3, "head")
+    train_stage(model, train_ds, val_ds, args.head_epochs, 1e-3, "head", model_dir)
     backbone.trainable = True
-    train_stage(model, train_ds, val_ds, args.full_epochs, 1e-4, "full")
+    train_stage(model, train_ds, val_ds, args.full_epochs, 1e-4, "full", model_dir)
 
-    report(model, *val)
+    report(model, *val, model_dir)
 
 
 if __name__ == "__main__":
