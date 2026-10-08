@@ -2,12 +2,15 @@
 Train the 14-joint pose regression model on the preprocessed COCO/MPII crops.
 
 Model: MobileNetV1 (alpha=0.25, ImageNet weights) backbone taking 96x96
-grayscale input, followed by a small regression head that outputs x, y in
-[0, 1] for each joint in JOINT_ORDER (28 values).
+grayscale input, followed by a small head that outputs x, y in [0, 1] for
+each joint in JOINT_ORDER (28 values), then a visibility score in [0, 1] for
+each joint (14 values): whether it is labeled and inside the crop.
 
 Training runs in two stages: head only with the backbone frozen, then the
 whole network at a lower learning rate. Unlabeled joints are excluded from
-the loss using the mask saved by preprocess_dataset.py.
+the coordinate loss using the mask saved by preprocess_dataset.py, and the
+mask is the target for the visibility scores. Some crops are zoomed in on a
+single joint so the model also sees partial bodies (see PARTIAL_PROB).
 
 Training can be stopped at any point (Ctrl+C, closing the terminal) and
 picks up where it left off when the same command is run again, losing at
@@ -17,7 +20,8 @@ start over.
 Each run lives in its own folder under MODELS_ROOT (models/<run>), with a
 copy of this script, so earlier models are kept for comparison.
 
-Usage: python train.py --run NAME [--limit N] [--head-epochs N] [--full-epochs N]
+Usage: python train.py --run NAME [--init-from RUN] [--limit N]
+                       [--head-epochs N] [--full-epochs N]
 """
 import argparse
 import csv
@@ -62,9 +66,15 @@ SCALE_RANGE = (0.8, 1.2)
 MAX_SHIFT_FRAC = 0.1
 MAX_BRIGHTNESS_DELTA = 0.2
 CONTRAST_RANGE = (0.7, 1.3)
+# Partial views: zoom in on one labeled joint so the rest of the body falls
+# outside the crop, like a webcam that only sees someone's face or torso.
+PARTIAL_PROB = 0.3
+PARTIAL_SCALE_RANGE = (1.5, 3.0)
 
 HUBER_DELTA = 0.05  # in normalized coords (~5 px at 96x96)
 PCK_THRESHOLD = 0.05  # a joint counts as correct within this distance (normalized)
+VIS_THRESHOLD = 0.5  # joints scored below this count as not visible
+VIS_LOSS_WEIGHT = 0.01  # brings visibility BCE to about the size of the coordinate loss
 
 
 def load_split(name, limit=None):
@@ -76,28 +86,22 @@ def load_split(name, limit=None):
     return images[..., None], labels, mask
 
 
-def augment(image, label, mask):
-    """Randomly flip, rotate, scale, shift, and relight a crop and its joints."""
-    pts = tf.reshape(label, (NUM_JOINTS, 2))
+def rotation_matrix(angle):
+    return tf.reshape(tf.stack([tf.cos(angle), -tf.sin(angle), tf.sin(angle), tf.cos(angle)]),
+                      (2, 2))
 
-    # Horizontal flip: mirror x and swap each left joint with its right joint.
-    flip = tf.random.uniform(()) < 0.5
-    image = tf.cond(flip, lambda: tf.image.flip_left_right(image), lambda: image)
-    flipped = tf.gather(tf.stack([1 - pts[:, 0], pts[:, 1]], axis=1), FLIP_PERM)
-    pts = tf.where(flip, flipped, pts)
-    mask = tf.where(flip, tf.gather(mask, FLIP_PERM), mask)
 
-    # Affine: points move by p' = s * R * (p - c) + c + t, around the crop center c.
-    angle = tf.random.uniform((), -1, 1) * MAX_ROTATION_DEG * math.pi / 180
-    scale = tf.random.uniform((), *SCALE_RANGE)
-    shift = tf.random.uniform((2,), -MAX_SHIFT_FRAC, MAX_SHIFT_FRAC)
-    cos, sin = tf.cos(angle), tf.sin(angle)
-    rot = tf.reshape(tf.stack([cos, -sin, sin, cos]), (2, 2))
-    pts = scale * tf.linalg.matvec(rot, pts - 0.5) + 0.5 + shift
+def warp(image, pts, mask, angle, scale, shift):
+    """Rotate, scale, and shift a crop and its (joints, 2) points about the center.
+
+    Joints pushed outside the crop no longer count as labeled.
+    """
+    # Points move by p' = s * R * (p - c) + c + t, around the crop center c.
+    pts = scale * tf.linalg.matvec(rotation_matrix(angle), pts - 0.5) + 0.5 + shift
 
     # The image transform maps each output pixel back to its input pixel:
     # p = A (p' - c - t) + c, where A = R^-1 / s.
-    inv = tf.reshape(tf.stack([cos, sin, -sin, cos]), (2, 2)) / scale
+    inv = rotation_matrix(-angle) / scale
     center = tf.constant([IMG_SIZE / 2, IMG_SIZE / 2])
     offset = center - tf.linalg.matvec(inv, center + shift * IMG_SIZE)
     transform = tf.stack([inv[0, 0], inv[0, 1], offset[0],
@@ -107,14 +111,51 @@ def augment(image, label, mask):
         output_shape=[IMG_SIZE, IMG_SIZE], fill_value=0.0,
         interpolation="BILINEAR", fill_mode="CONSTANT")[0]
 
-    # Joints pushed outside the crop no longer count as labeled.
     inside = tf.reduce_all((pts >= 0) & (pts <= 1), axis=1)
-    mask = mask * tf.cast(inside, tf.float32)
+    return image, pts, mask * tf.cast(inside, tf.float32)
+
+
+def zoom_on_joint(pts, mask, angle):
+    """Return (scale, shift) for warp() that zoom in on a random labeled joint."""
+    scale = tf.random.uniform((), *PARTIAL_SCALE_RANGE)
+    joint = tf.random.categorical(tf.math.log(mask)[None], 1)[0, 0]
+    jitter = tf.random.uniform((2,), -MAX_SHIFT_FRAC, MAX_SHIFT_FRAC)
+    # Shift so the chosen joint lands near the center after scaling and rotating.
+    focus = tf.gather(pts, joint) - 0.5
+    return scale, -scale * tf.linalg.matvec(rotation_matrix(angle), focus) + jitter
+
+
+def augment(image, label, mask):
+    """Randomly flip, rotate, zoom, shift, and relight a crop and its joints."""
+    pts = tf.reshape(label, (NUM_JOINTS, 2))
+
+    # Horizontal flip: mirror x and swap each left joint with its right joint.
+    flip = tf.random.uniform(()) < 0.5
+    image = tf.cond(flip, lambda: tf.image.flip_left_right(image), lambda: image)
+    flipped = tf.gather(tf.stack([1 - pts[:, 0], pts[:, 1]], axis=1), FLIP_PERM)
+    pts = tf.where(flip, flipped, pts)
+    mask = tf.where(flip, tf.gather(mask, FLIP_PERM), mask)
+
+    angle = tf.random.uniform((), -1, 1) * MAX_ROTATION_DEG * math.pi / 180
+    scale, shift = tf.cond(
+        tf.random.uniform(()) < PARTIAL_PROB,
+        lambda: zoom_on_joint(pts, mask, angle),
+        lambda: (tf.random.uniform((), *SCALE_RANGE),
+                 tf.random.uniform((2,), -MAX_SHIFT_FRAC, MAX_SHIFT_FRAC)))
+    image, pts, mask = warp(image, pts, mask, angle, scale, shift)
 
     image = tf.image.random_brightness(image, MAX_BRIGHTNESS_DELTA * 255)
     image = tf.image.random_contrast(image, *CONTRAST_RANGE)
     image = tf.clip_by_value(image, 0, 255)
 
+    return image, tf.reshape(pts, (-1,)), mask
+
+
+def partial_view(image, label, mask):
+    """Zoom in on a random labeled joint with no other changes, for evaluation."""
+    pts = tf.reshape(label, (NUM_JOINTS, 2))
+    scale, shift = zoom_on_joint(pts, mask, 0.0)
+    image, pts, mask = warp(image, pts, mask, 0.0, scale, shift)
     return image, tf.reshape(pts, (-1,)), mask
 
 
@@ -151,7 +192,7 @@ def build_backbone():
 
 
 def build_model():
-    """Backbone plus regression head: raw 0-255 grayscale in, 28 coords in [0, 1] out.
+    """Backbone plus head: raw 0-255 grayscale in, 28 coords then 14 visibility scores out.
 
     The head flattens a reduced 3x3 feature map instead of global average
     pooling, since pooling would throw away where in the frame features are.
@@ -160,11 +201,13 @@ def build_model():
     inputs = keras.Input((IMG_SIZE, IMG_SIZE, 1))
     x = layers.Rescaling(1 / 127.5, offset=-1)(inputs)  # MobileNet expects [-1, 1]
     x = backbone(x)
-    x = layers.Conv2D(64, 1, activation="relu")(x)
+    x = layers.Conv2D(64, 1, activation="relu", name="features")(x)
     x = layers.Flatten()(x)
-    x = layers.Dense(128, activation="relu")(x)
+    x = layers.Dense(128, activation="relu", name="hidden")(x)
     x = layers.Dropout(0.2)(x)
-    outputs = layers.Dense(2 * NUM_JOINTS, activation="sigmoid")(x)
+    coords = layers.Dense(2 * NUM_JOINTS, activation="sigmoid", name="coords")(x)
+    visibility = layers.Dense(NUM_JOINTS, activation="sigmoid", name="visibility")(x)
+    outputs = layers.Concatenate(name="pose")([coords, visibility])
     return keras.Model(inputs, outputs, name="pose_model"), backbone
 
 
@@ -172,16 +215,20 @@ def split_target(y_true, y_pred):
     """Return (true points, predicted points, mask) shaped (N, joints, 2 / -)."""
     labels, mask = y_true[:, :2 * NUM_JOINTS], y_true[:, 2 * NUM_JOINTS:]
     return (tf.reshape(labels, (-1, NUM_JOINTS, 2)),
-            tf.reshape(y_pred, (-1, NUM_JOINTS, 2)), mask)
+            tf.reshape(y_pred[:, :2 * NUM_JOINTS], (-1, NUM_JOINTS, 2)), mask)
 
 
-def masked_huber_loss(y_true, y_pred):
-    """Huber loss per coordinate, averaged over labeled joints only."""
+def pose_loss(y_true, y_pred):
+    """Huber loss per coordinate over labeled joints, plus visibility cross-entropy."""
     true_pts, pred_pts, mask = split_target(y_true, y_pred)
     err = tf.abs(true_pts - pred_pts)
     huber = tf.where(err < HUBER_DELTA, 0.5 * err ** 2, HUBER_DELTA * (err - 0.5 * HUBER_DELTA))
     per_joint = tf.reduce_sum(huber, axis=2)
-    return tf.reduce_sum(per_joint * mask) / tf.maximum(tf.reduce_sum(mask), 1)
+    coord_loss = tf.reduce_sum(per_joint * mask) / tf.maximum(tf.reduce_sum(mask), 1)
+
+    vis = y_pred[:, 2 * NUM_JOINTS:]
+    vis_loss = tf.reduce_mean(keras.losses.binary_crossentropy(mask[..., None], vis[..., None]))
+    return coord_loss + VIS_LOSS_WEIGHT * vis_loss
 
 
 def joint_distances(y_true, y_pred):
@@ -201,6 +248,35 @@ def pck(y_true, y_pred):
     dist, mask = joint_distances(y_true, y_pred)
     hits = tf.cast(dist < PCK_THRESHOLD, tf.float32) * mask
     return tf.reduce_sum(hits) / tf.maximum(tf.reduce_sum(mask), 1)
+
+
+def vis_acc(y_true, y_pred):
+    """Fraction of joints whose visible / not-visible call matches the mask."""
+    mask, vis = y_true[:, 2 * NUM_JOINTS:], y_pred[:, 2 * NUM_JOINTS:]
+    return tf.reduce_mean(tf.cast((vis > VIS_THRESHOLD) == (mask > 0), tf.float32))
+
+
+def init_from_run(model, run):
+    """Copy weights from an earlier run's model wherever layers line up.
+
+    Layers with weights are paired in order. A layer whose weight shapes don't
+    match the next unused source layer (such as a newly added head) keeps its
+    fresh weights.
+    """
+    path = os.path.join(MODELS_ROOT, run, MODEL_FILENAME)
+    src_layers = [l for l in keras.models.load_model(path, compile=False).layers if l.weights]
+    print(f"Initializing from {path}:")
+    i = 0
+    for layer in model.layers:
+        if not layer.weights:
+            continue
+        if i < len(src_layers) and ([w.shape for w in layer.weights]
+                                    == [w.shape for w in src_layers[i].weights]):
+            layer.set_weights(src_layers[i].get_weights())
+            print(f"  {layer.name} <- {src_layers[i].name}")
+            i += 1
+        else:
+            print(f"  {layer.name}: no matching layer, left as initialized")
 
 
 def best_val_loss(model_dir):
@@ -226,8 +302,8 @@ def train_stage(model, train_ds, val_ds, epochs, lr, name, model_dir):
         model.load_weights(model_path)
         return
 
-    model.compile(optimizer=keras.optimizers.Adam(lr), loss=masked_huber_loss,
-                  metrics=[mean_px_error, pck])
+    model.compile(optimizer=keras.optimizers.Adam(lr), loss=pose_loss,
+                  metrics=[mean_px_error, pck, vis_acc])
     callbacks = [
         keras.callbacks.BackupAndRestore(os.path.join(model_dir, f"backup_{name}"),
                                          save_freq=BACKUP_EVERY_STEPS),
@@ -247,31 +323,41 @@ def train_stage(model, train_ds, val_ds, epochs, lr, name, model_dir):
 
 
 def report(model, images, labels, mask, model_dir, split="val"):
-    """Print per-joint error on a split, save a grid of predictions, and return them."""
+    """Print per-joint error on a split, save a grid of predictions, and return them.
+
+    Also works for models without visibility scores (v1), which output only coords.
+    """
     pred = model.predict(images, batch_size=256, verbose=0)
-    dist = np.linalg.norm((pred - labels).reshape(-1, NUM_JOINTS, 2), axis=2)
+    coords, vis = pred[:, :2 * NUM_JOINTS], pred[:, 2 * NUM_JOINTS:]
+    has_vis = vis.shape[1] > 0
+    dist = np.linalg.norm((coords - labels).reshape(-1, NUM_JOINTS, 2), axis=2)
 
     labeled = dist[mask > 0]
+    vis_text = (f", visibility acc {((vis > VIS_THRESHOLD) == (mask > 0)).mean():.3f}"
+                if has_vis else "")
     print(f"Overall {split} error: {IMG_SIZE * labeled.mean():.2f} px, "
-          f"PCK {(labeled < PCK_THRESHOLD).mean():.3f}")
+          f"PCK {(labeled < PCK_THRESHOLD).mean():.3f}{vis_text}")
     print(f"Per-joint {split} error (px at 96x96) / PCK:")
     for j, name in enumerate(JOINT_ORDER):
         d = dist[mask[:, j] > 0, j]
         print(f"  {name:<11} {IMG_SIZE * d.mean():5.2f} px   {(d < PCK_THRESHOLD).mean():.3f}")
 
-    # True joints in green, predictions in red, every crop scaled up 2x.
+    # True joints in green, predictions in red (hollow if scored not visible),
+    # every crop scaled up 2x.
     tile, cols, rows = 2 * IMG_SIZE, 6, 4
     grid = Image.new("RGB", (cols * tile, rows * tile))
     for k, i in enumerate(np.random.RandomState(0).choice(len(images), cols * rows, replace=False)):
         crop = Image.fromarray(images[i, ..., 0]).convert("RGB").resize((tile, tile))
         draw = ImageDraw.Draw(crop)
         for j in range(NUM_JOINTS):
-            px, py = pred[i, 2 * j] * tile, pred[i, 2 * j + 1] * tile
+            px, py = coords[i, 2 * j] * tile, coords[i, 2 * j + 1] * tile
             if mask[i, j]:
                 tx, ty = labels[i, 2 * j] * tile, labels[i, 2 * j + 1] * tile
                 draw.line((tx, ty, px, py), fill=(255, 255, 0))
                 draw.ellipse((tx - 3, ty - 3, tx + 3, ty + 3), fill=(0, 255, 0))
-            draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(255, 0, 0))
+            visible = not has_vis or vis[i, j] > VIS_THRESHOLD
+            draw.ellipse((px - 3, py - 3, px + 3, py + 3),
+                         fill=(255, 0, 0) if visible else None, outline=(255, 0, 0))
         grid.paste(crop, ((k % cols) * tile, (k // cols) * tile))
     path = os.path.join(model_dir, f"{split}_predictions.png")
     grid.save(path)
@@ -282,6 +368,8 @@ def report(model, images, labels, mask, model_dir, split="val"):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--run", required=True, help="name of the run's folder under models/")
+    parser.add_argument("--init-from", metavar="RUN",
+                        help="start from an earlier run's weights instead of ImageNet")
     parser.add_argument("--limit", type=int, help="only use the first N crops of each split (for testing)")
     parser.add_argument("--head-epochs", type=int, default=5)
     parser.add_argument("--full-epochs", type=int, default=40)
@@ -298,6 +386,8 @@ def main():
     print(f"Train: {len(train[0])} crops, val: {len(val[0])} crops")
 
     model, backbone = build_model()
+    if args.init_from:
+        init_from_run(model, args.init_from)
     model.summary()
 
     backbone.trainable = False

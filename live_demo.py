@@ -3,7 +3,8 @@ Run the trained pose model on a live webcam feed.
 
 The model was trained on square crops framed around one person, so it only
 looks at a square box in the middle of the frame. Stand so your body fills
-the box, head near the top and feet near the bottom.
+the box, head near the top and feet near the bottom. Models with visibility
+scores (v2 on) hide the joints they think are outside the box.
 
 Controls: '+' / '-' = grow / shrink the box, 'q' = quit
 
@@ -18,7 +19,8 @@ import numpy as np
 import tensorflow as tf
 from tensorflow import keras
 
-from train import DEFAULT_RUN, IMG_SIZE, JOINT_ORDER, MODEL_FILENAME, MODELS_ROOT
+from train import (DEFAULT_RUN, IMG_SIZE, JOINT_ORDER, MODEL_FILENAME, MODELS_ROOT,
+                   NUM_JOINTS, VIS_THRESHOLD)
 
 CAMERA_INDEX = 0
 MIRROR_CAMERA = True
@@ -79,12 +81,17 @@ def main():
         # Predictions are in [0, 1] within the crop; map them back to the frame.
         pts = {name: (int(x0 + pred[2 * j] * side), int(y0 + pred[2 * j + 1] * side))
                for j, name in enumerate(JOINT_ORDER)}
+        # v1 has no visibility scores, so every joint is drawn.
+        vis = pred[2 * NUM_JOINTS:]
+        shown = {name for j, name in enumerate(JOINT_ORDER)
+                 if not len(vis) or vis[j] > VIS_THRESHOLD}
 
         cv2.rectangle(frame, (x0, y0), (x0 + side, y0 + side), BOX_COLOR, 2)
         for a, b in BONES:
-            cv2.line(frame, pts[a], pts[b], BONE_COLOR, 2)
-        for p in pts.values():
-            cv2.circle(frame, p, JOINT_RADIUS, JOINT_COLOR, -1)
+            if a in shown and b in shown:
+                cv2.line(frame, pts[a], pts[b], BONE_COLOR, 2)
+        for name in shown:
+            cv2.circle(frame, pts[name], JOINT_RADIUS, JOINT_COLOR, -1)
         cv2.putText(frame, f"{args.run}: {infer_ms:.1f} ms", (10, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, BOX_COLOR, 2)
 
