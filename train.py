@@ -11,15 +11,20 @@ the loss using the mask saved by preprocess_dataset.py.
 
 Training can be stopped at any point (Ctrl+C, closing the terminal) and
 picks up where it left off when the same command is run again, losing at
-most BACKUP_EVERY_STEPS batches of progress. Delete MODEL_DIR to start over.
+most BACKUP_EVERY_STEPS batches of progress. Delete the run's folder to
+start over.
 
-Usage: python train.py [--limit N] [--head-epochs N] [--full-epochs N]
+Each run lives in its own folder under MODELS_ROOT (models/<run>), with a
+copy of this script, so earlier models are kept for comparison.
+
+Usage: python train.py --run NAME [--limit N] [--head-epochs N] [--full-epochs N]
 """
 import argparse
 import csv
 import glob
 import math
 import os
+import shutil
 
 import numpy as np
 import tensorflow as tf
@@ -28,8 +33,8 @@ from tensorflow import keras
 from tensorflow.keras import layers
 
 DATA_PREFIX = "pose_dataset"
-MODEL_DIR = "models"
-SAMPLE_MODEL_DIR = os.path.join(MODEL_DIR, "sample")  # used for --limit test runs
+MODELS_ROOT = "models"
+DEFAULT_RUN = "v1"  # used by evaluate.py and live_demo.py when no run is given
 MODEL_FILENAME = "pose_model.keras"
 BACKUP_EVERY_STEPS = 200  # ~1 min of training on CPU
 
@@ -241,12 +246,15 @@ def train_stage(model, train_ds, val_ds, epochs, lr, name, model_dir):
     open(done_path, "w").close()
 
 
-def report(model, images, labels, mask, model_dir):
-    """Print per-joint val error and save a grid of predictions over crops."""
+def report(model, images, labels, mask, model_dir, split="val"):
+    """Print per-joint error on a split, save a grid of predictions, and return them."""
     pred = model.predict(images, batch_size=256, verbose=0)
     dist = np.linalg.norm((pred - labels).reshape(-1, NUM_JOINTS, 2), axis=2)
 
-    print("Per-joint val error (px at 96x96) / PCK:")
+    labeled = dist[mask > 0]
+    print(f"Overall {split} error: {IMG_SIZE * labeled.mean():.2f} px, "
+          f"PCK {(labeled < PCK_THRESHOLD).mean():.3f}")
+    print(f"Per-joint {split} error (px at 96x96) / PCK:")
     for j, name in enumerate(JOINT_ORDER):
         d = dist[mask[:, j] > 0, j]
         print(f"  {name:<11} {IMG_SIZE * d.mean():5.2f} px   {(d < PCK_THRESHOLD).mean():.3f}")
@@ -265,19 +273,24 @@ def report(model, images, labels, mask, model_dir):
                 draw.ellipse((tx - 3, ty - 3, tx + 3, ty + 3), fill=(0, 255, 0))
             draw.ellipse((px - 3, py - 3, px + 3, py + 3), fill=(255, 0, 0))
         grid.paste(crop, ((k % cols) * tile, (k // cols) * tile))
-    path = os.path.join(model_dir, "val_predictions.png")
+    path = os.path.join(model_dir, f"{split}_predictions.png")
     grid.save(path)
     print(f"Saved prediction grid to {path}")
+    return pred
 
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument("--run", required=True, help="name of the run's folder under models/")
     parser.add_argument("--limit", type=int, help="only use the first N crops of each split (for testing)")
     parser.add_argument("--head-epochs", type=int, default=5)
     parser.add_argument("--full-epochs", type=int, default=40)
     args = parser.parse_args()
-    model_dir = SAMPLE_MODEL_DIR if args.limit else MODEL_DIR
+    model_dir = os.path.join(MODELS_ROOT, args.run)
     os.makedirs(model_dir, exist_ok=True)
+    script_copy = os.path.join(model_dir, "train.py")
+    if not os.path.exists(script_copy):  # keep the code that started the run
+        shutil.copy(__file__, script_copy)
 
     train = load_split("train", args.limit)
     val = load_split("val", args.limit)
