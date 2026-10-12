@@ -5,33 +5,35 @@ For each run, prints per-joint error and saves a grid of predictions to
 models/<run>/{split}_predictions.png. With several runs, also prints a
 side-by-side comparison table.
 
---partial zooms every crop in on one random labeled joint first (the same
-zoom for every run), to test crops that only show part of a body, such as a
-webcam pointed at someone's face.
+--partial uses the partial-body crops from preprocess_dataset.py --partial
+instead, which show only part of a person, like a webcam pointed at someone's
+face. Adding --blurred blurs those crops to the detail they would keep if cut
+out of a 96x96 whole-body crop, which is how v2's partial crops were made.
+A model that scores much better blurred than sharp is using blur as a cue.
 
-Usage: python evaluate.py [RUN ...] [--split test|val|train] [--partial] [--limit N]
-  e.g. python evaluate.py v1 v2 --split test --partial
+Usage: python evaluate.py [RUN ...] [--split test|val|train] [--partial [--blurred]]
+                          [--limit N]
+  e.g. python evaluate.py v2 v3 --split test --partial
 """
 import argparse
 import os
 
+import cv2
 import numpy as np
-import tensorflow as tf
 from tensorflow import keras
 
-from train import (DEFAULT_RUN, IMG_SIZE, JOINT_ORDER, MODEL_FILENAME, MODELS_ROOT,
-                   NUM_JOINTS, PCK_THRESHOLD, VIS_THRESHOLD, load_split, partial_view, report)
-
-PARTIAL_SEED = 0
+from train import (DATA_PREFIX, DEFAULT_RUN, IMG_SIZE, JOINT_ORDER, MODEL_FILENAME,
+                   MODELS_ROOT, NUM_JOINTS, PCK_THRESHOLD, VIS_THRESHOLD, load_split, report)
 
 
-def make_partial(images, labels, mask):
-    """Return copies of the crops, each zoomed in on one random labeled joint."""
-    tf.random.set_seed(PARTIAL_SEED)
-    ds = tf.data.Dataset.from_tensor_slices((images.astype(np.float32), labels, mask))
-    ds = ds.map(partial_view).batch(1024)
-    parts = [np.concatenate(x) for x in zip(*[(i.numpy(), l.numpy(), m.numpy()) for i, l, m in ds])]
-    return np.clip(np.round(parts[0]), 0, 255).astype(np.uint8), parts[1], parts[2]
+def blur_like_zoomed(images, zooms):
+    """Shrink each crop by its zoom factor and scale it back up."""
+    out = np.empty_like(images)
+    for i, (im, zoom) in enumerate(zip(images[..., 0], zooms)):
+        small = max(4, round(IMG_SIZE / zoom))
+        small_im = cv2.resize(im, (small, small), interpolation=cv2.INTER_AREA)
+        out[i, ..., 0] = cv2.resize(small_im, (IMG_SIZE, IMG_SIZE), interpolation=cv2.INTER_LINEAR)
+    return out
 
 
 def joint_stats(pred, labels, mask):
@@ -54,15 +56,20 @@ def main():
                         help=f"run folders under {MODELS_ROOT}/ (default: {DEFAULT_RUN})")
     parser.add_argument("--split", default="test", choices=["train", "val", "test"])
     parser.add_argument("--partial", action="store_true",
-                        help="zoom each crop in on one joint to test partial bodies")
+                        help="use the partial-body crops to test partial bodies")
+    parser.add_argument("--blurred", action="store_true",
+                        help="with --partial, blur the crops like v2's zoomed training crops")
     parser.add_argument("--limit", type=int, help="only use the first N crops of the split")
     args = parser.parse_args()
 
-    images, labels, mask = load_split(args.split, args.limit)
-    name = args.split
-    if args.partial:
-        images, labels, mask = make_partial(images, labels, mask)
-        name += "_partial"
+    if args.blurred and not args.partial:
+        parser.error("--blurred needs --partial")
+    images, labels, mask = load_split(args.split, args.limit, partial=args.partial)
+    name = args.split + ("_partial" if args.partial else "")
+    if args.blurred:
+        zooms = np.load(f"{DATA_PREFIX}_partial_{args.split}.npz")["zoom"][:len(images)]
+        images = blur_like_zoomed(images, zooms)
+        name += "_blurred"
     print(f"{name}: {len(images)} crops, {mask.mean():.0%} of joints visible and labeled")
 
     results = {}

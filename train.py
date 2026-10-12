@@ -9,8 +9,9 @@ each joint (14 values): whether it is labeled and inside the crop.
 Training runs in two stages: head only with the backbone frozen, then the
 whole network at a lower learning rate. Unlabeled joints are excluded from
 the coordinate loss using the mask saved by preprocess_dataset.py, and the
-mask is the target for the visibility scores. Some crops are zoomed in on a
-single joint so the model also sees partial bodies (see PARTIAL_PROB).
+mask is the target for the visibility scores. Training and validation mix
+whole-body crops with sharp partial-body crops (preprocess_dataset.py
+--partial), so the model also learns which joints are missing from a crop.
 
 Training can be stopped at any point (Ctrl+C, closing the terminal) and
 picks up where it left off when the same command is run again, losing at
@@ -66,10 +67,6 @@ SCALE_RANGE = (0.8, 1.2)
 MAX_SHIFT_FRAC = 0.1
 MAX_BRIGHTNESS_DELTA = 0.2
 CONTRAST_RANGE = (0.7, 1.3)
-# Partial views: zoom in on one labeled joint so the rest of the body falls
-# outside the crop, like a webcam that only sees someone's face or torso.
-PARTIAL_PROB = 0.3
-PARTIAL_SCALE_RANGE = (1.5, 3.0)
 
 HUBER_DELTA = 0.05  # in normalized coords (~5 px at 96x96)
 PCK_THRESHOLD = 0.05  # a joint counts as correct within this distance (normalized)
@@ -77,13 +74,28 @@ VIS_THRESHOLD = 0.5  # joints scored below this count as not visible
 VIS_LOSS_WEIGHT = 0.01  # brings visibility BCE to about the size of the coordinate loss
 
 
-def load_split(name, limit=None):
-    """Return (images, labels, mask) for one split; images get a channel axis."""
-    data = np.load(f"{DATA_PREFIX}_{name}.npz")
+def load_split(name, limit=None, partial=False):
+    """Return (images, labels, mask) for one split; images get a channel axis.
+
+    partial=True loads the partial-body crops instead of the whole-body ones.
+    """
+    data = np.load(f"{DATA_PREFIX}{'_partial' if partial else ''}_{name}.npz")
     images, labels, mask = data["images"], data["labels"], data["mask"]
     if limit:
         images, labels, mask = images[:limit], labels[:limit], mask[:limit]
     return images[..., None], labels, mask
+
+
+def load_mixed_split(name, limit=None):
+    """Whole-body and partial-body crops for one split, shuffled together.
+
+    Shuffling here matters: the tf.data shuffle buffer is far smaller than the
+    dataset, so without it batches would hold only one kind of crop at a time.
+    """
+    parts = [load_split(name, limit), load_split(name, limit, partial=True)]
+    images, labels, mask = (np.concatenate(arrays) for arrays in zip(*parts))
+    order = np.random.default_rng(0).permutation(len(images))
+    return images[order], labels[order], mask[order]
 
 
 def rotation_matrix(angle):
@@ -115,18 +127,8 @@ def warp(image, pts, mask, angle, scale, shift):
     return image, pts, mask * tf.cast(inside, tf.float32)
 
 
-def zoom_on_joint(pts, mask, angle):
-    """Return (scale, shift) for warp() that zoom in on a random labeled joint."""
-    scale = tf.random.uniform((), *PARTIAL_SCALE_RANGE)
-    joint = tf.random.categorical(tf.math.log(mask)[None], 1)[0, 0]
-    jitter = tf.random.uniform((2,), -MAX_SHIFT_FRAC, MAX_SHIFT_FRAC)
-    # Shift so the chosen joint lands near the center after scaling and rotating.
-    focus = tf.gather(pts, joint) - 0.5
-    return scale, -scale * tf.linalg.matvec(rotation_matrix(angle), focus) + jitter
-
-
 def augment(image, label, mask):
-    """Randomly flip, rotate, zoom, shift, and relight a crop and its joints."""
+    """Randomly flip, rotate, scale, shift, and relight a crop and its joints."""
     pts = tf.reshape(label, (NUM_JOINTS, 2))
 
     # Horizontal flip: mirror x and swap each left joint with its right joint.
@@ -137,25 +139,14 @@ def augment(image, label, mask):
     mask = tf.where(flip, tf.gather(mask, FLIP_PERM), mask)
 
     angle = tf.random.uniform((), -1, 1) * MAX_ROTATION_DEG * math.pi / 180
-    scale, shift = tf.cond(
-        tf.random.uniform(()) < PARTIAL_PROB,
-        lambda: zoom_on_joint(pts, mask, angle),
-        lambda: (tf.random.uniform((), *SCALE_RANGE),
-                 tf.random.uniform((2,), -MAX_SHIFT_FRAC, MAX_SHIFT_FRAC)))
+    scale = tf.random.uniform((), *SCALE_RANGE)
+    shift = tf.random.uniform((2,), -MAX_SHIFT_FRAC, MAX_SHIFT_FRAC)
     image, pts, mask = warp(image, pts, mask, angle, scale, shift)
 
     image = tf.image.random_brightness(image, MAX_BRIGHTNESS_DELTA * 255)
     image = tf.image.random_contrast(image, *CONTRAST_RANGE)
     image = tf.clip_by_value(image, 0, 255)
 
-    return image, tf.reshape(pts, (-1,)), mask
-
-
-def partial_view(image, label, mask):
-    """Zoom in on a random labeled joint with no other changes, for evaluation."""
-    pts = tf.reshape(label, (NUM_JOINTS, 2))
-    scale, shift = zoom_on_joint(pts, mask, 0.0)
-    image, pts, mask = warp(image, pts, mask, 0.0, scale, shift)
     return image, tf.reshape(pts, (-1,)), mask
 
 
@@ -380,8 +371,8 @@ def main():
     if not os.path.exists(script_copy):  # keep the code that started the run
         shutil.copy(__file__, script_copy)
 
-    train = load_split("train", args.limit)
-    val = load_split("val", args.limit)
+    train = load_mixed_split("train", args.limit)
+    val = load_mixed_split("val", args.limit)
     train_ds, val_ds = make_dataset(*train, training=True), make_dataset(*val, training=False)
     print(f"Train: {len(train[0])} crops, val: {len(val[0])} crops")
 
@@ -395,7 +386,8 @@ def main():
     backbone.trainable = True
     train_stage(model, train_ds, val_ds, args.full_epochs, 1e-4, "full", model_dir)
 
-    report(model, *val, model_dir)
+    report(model, *load_split("val", args.limit), model_dir, "val")
+    report(model, *load_split("val", args.limit, partial=True), model_dir, "val_partial")
 
 
 if __name__ == "__main__":
