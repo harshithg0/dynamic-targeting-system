@@ -7,4 +7,9 @@ coco-2017/
 mpii_human_pose_v1/
 *.npz
 venv-train/
-models/
+# Trained runs: keep each model, its training history and the script that
+# trained it; logs, backups and prediction images stay local.
+models/*/*
+!models/*/pose_model.keras
+!models/*/history_*.csv
+!models/*/train.py
