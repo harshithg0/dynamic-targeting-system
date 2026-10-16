@@ -38,9 +38,10 @@ try one on the webcam with `python live_demo.py v3`.
 - Hides off-screen joints on sharp crops. It scores about the same on sharp and
   blurred crops, so it no longer relies on blur. Confirmed working on the
   webcam (face-only view).
-- The model here is from epoch 28 of the second training stage. Training was
-  still running when this was committed, but later epochs were improving by
-  about 0.01 px, so a newer file would barely differ.
+- The model here is from epoch 34 of the second training stage, the best of
+  its 40 epochs (12.53 px on the validation split). The test results below
+  were measured on the epoch 28 model; later epochs improved by about
+  0.01 px, so they barely differ.
 
 ## Results on the test split
 
